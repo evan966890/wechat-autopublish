@@ -20,18 +20,14 @@ Usage:
 """
 
 import argparse
-import email.generator
 import glob
-import io
 import json
-import mimetypes
 import os
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
-import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -122,19 +118,6 @@ def _get_discord_creds():
     return token, channel
 
 
-def _discord_request(method: str, url: str, headers: dict,
-                     data: bytes = None, timeout: int = 30):
-    """Make an HTTP request with optional proxy support."""
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-    if proxy:
-        handler = urllib.request.ProxyHandler({"https": proxy, "http": proxy})
-        opener = urllib.request.build_opener(handler)
-    else:
-        opener = urllib.request.build_opener()
-    return opener.open(req, timeout=timeout)
-
-
 def _get_avatar_url(agent_id: str) -> str:
     cfg = get_agent_config(agent_id)
     seed = cfg.get("avatar_seed", agent_id)
@@ -142,8 +125,16 @@ def _get_avatar_url(agent_id: str) -> str:
     return f"https://api.dicebear.com/7.x/bottts-neutral/png?seed={seed}&backgroundColor={bg}"
 
 
+def _curl_proxy_args() -> list:
+    """Return curl proxy arguments if HTTPS_PROXY is set."""
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if proxy:
+        return ["--proxy", proxy]
+    return []
+
+
 def discord_msg(agent_id: str, message: str):
-    """Send a Discord message via webhook-style bot post. Silent on failure or missing creds."""
+    """Send a Discord message via curl. Silent on failure or missing creds."""
     token, channel = _get_discord_creds()
     if not token or not channel:
         return
@@ -161,21 +152,23 @@ def discord_msg(agent_id: str, message: str):
                 "name": display_name,
                 "icon_url": _get_avatar_url(agent_id),
             },
-            "timestamp": datetime.utcnow().isoformat() + "Z",
         }]
-    }).encode("utf-8")
+    })
 
     try:
-        _discord_request("POST", url, {
-            "Authorization": f"Bot {token}",
-            "Content-Type": "application/json",
-        }, body)
+        subprocess.run(
+            ["curl", "-s", "-X", "POST", url,
+             "-H", f"Authorization: Bot {token}",
+             "-H", "Content-Type: application/json",
+             "-d", body] + _curl_proxy_args(),
+            capture_output=True, text=True, timeout=30,
+        )
     except Exception as e:
         print(f"  [WARN] Discord message failed: {e}")
 
 
 def discord_file(agent_id: str, file_path: str, caption: str):
-    """Upload a file to Discord with caption. Silent on failure or missing creds."""
+    """Upload a file to Discord with caption via curl. Silent on failure or missing creds."""
     token, channel = _get_discord_creds()
     if not token or not channel:
         return
@@ -185,9 +178,6 @@ def discord_file(agent_id: str, file_path: str, caption: str):
     color = cfg.get("color", 0x95a5a6)
 
     url = f"https://discord.com/api/v10/channels/{channel}/messages"
-    boundary = uuid.uuid4().hex
-
-    # Build multipart body
     payload_json = json.dumps({
         "embeds": [{
             "description": caption,
@@ -199,33 +189,14 @@ def discord_file(agent_id: str, file_path: str, caption: str):
         }]
     })
 
-    filename = os.path.basename(file_path)
-    content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
-
-    body = io.BytesIO()
-
-    def write_line(text: str):
-        body.write(text.encode("utf-8"))
-
-    # Part 1: payload_json
-    write_line(f"--{boundary}\r\n")
-    write_line(f'Content-Disposition: form-data; name="payload_json"\r\n')
-    write_line(f"Content-Type: application/json\r\n\r\n")
-    write_line(f"{payload_json}\r\n")
-
-    # Part 2: file
-    write_line(f"--{boundary}\r\n")
-    write_line(f'Content-Disposition: form-data; name="files[0]"; filename="{filename}"\r\n')
-    write_line(f"Content-Type: {content_type}\r\n\r\n")
-    with open(file_path, "rb") as f:
-        body.write(f.read())
-    write_line(f"\r\n--{boundary}--\r\n")
-
     try:
-        _discord_request("POST", url, {
-            "Authorization": f"Bot {token}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        }, body.getvalue(), timeout=60)
+        subprocess.run(
+            ["curl", "-s", "-X", "POST", url,
+             "-H", f"Authorization: Bot {token}",
+             "-F", f"payload_json={payload_json}",
+             "-F", f"files[0]=@{file_path}"] + _curl_proxy_args(),
+            capture_output=True, text=True, timeout=60,
+        )
     except Exception as e:
         print(f"  [WARN] Discord file upload failed: {e}")
 
