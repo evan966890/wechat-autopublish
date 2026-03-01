@@ -1,0 +1,25 @@
+{
+  "articles_dir": "~/articles",
+  "chrome_crawl_dir": "~/.chrome-crawl",
+  "author": "My WeChat Account",
+  "agents": {
+    "chief-director": {
+      "name": "Director",
+      "color": 16028438,
+      "avatar_seed": "boss-nolan-v3",
+      "avatar_bg": "fed7aa"
+    },
+    "visual-designer": {
+      "name": "Designer",
+      "color": 15315720,
+      "avatar_seed": "design-felix-v3",
+      "avatar_bg": "fde68a"
+    },
+    "wechat-ops": {
+      "name": "Publisher",
+      "color": 3066993,
+      "avatar_seed": "ops-luna-v3",
+      "avatar_bg": "a7f3d0"
+    }
+  }
+}

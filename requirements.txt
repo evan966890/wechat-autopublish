@@ -1,0 +1,2 @@
+wechatpy>=2.0.0
+mistune>=3.0.0
