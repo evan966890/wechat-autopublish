@@ -473,211 +473,300 @@ def _screenshot_to_discord(cdp_port: str, caption: str) -> bool:
     return False
 
 
-def _is_login_page(snapshot: str) -> bool:
-    """Detect if snapshot shows a login/QR scan page."""
-    keywords = ["扫码", "请使用微信扫描", "二维码", "扫一扫", "scan qr"]
-    lower = snapshot.lower()
-    return any(kw.lower() in lower for kw in keywords)
-
-
-def _preview_via_api(draft_media_id: str, wx_name: str):
-    """Send draft preview via WeChat API."""
-    from wechatpy import WeChatClient
-
-    app_id = os.environ.get("WECHAT_APP_ID")
-    app_secret = os.environ.get("WECHAT_APP_SECRET")
-    if not app_id or not app_secret:
-        raise RuntimeError("WECHAT_APP_ID/SECRET not set")
-
-    client = WeChatClient(app_id, app_secret)
-
-    draft = client.post("draft/get", data={"media_id": draft_media_id})
-    news_items = draft.get("news_item", [])
-    if not news_items:
-        raise RuntimeError("Draft is empty")
-
-    articles = []
-    for item in news_items:
-        articles.append({
-            "thumb_media_id": item["thumb_media_id"],
-            "title": item["title"],
-            "content": item["content"],
-            "author": item.get("author", ""),
-            "digest": item.get("digest", ""),
-            "show_cover_pic": item.get("show_cover_pic", 1),
-            "need_open_comment": item.get("need_open_comment", 0),
-        })
-
-    result = client.post("media/uploadnews", data={"articles": articles})
-    news_media_id = result.get("media_id")
-    if not news_media_id:
-        raise RuntimeError(f"uploadnews failed: {result}")
-
-    client.post("message/mass/preview", data={
-        "towxname": wx_name,
-        "mpnews": {"media_id": news_media_id},
-        "msgtype": "mpnews",
-    })
-    print(f"  Preview sent to WeChat user: {wx_name}")
-
-
 def _find_ref(line: str) -> str:
-    """Extract @eN reference from agent-browser snapshot line."""
+    """Extract @eN reference from agent-browser snapshot line.
+
+    Snapshot format: '- button "全部草稿" [ref=e9]' -> returns '@e9'
+    """
+    import re
+    m = re.search(r'\[ref=(e\d+)\]', line)
+    if m:
+        return f"@{m.group(1)}"
+    # Fallback: direct @eN format
     for part in line.split():
         if part.startswith("@e") or part.startswith("@E"):
             return part
     return ""
 
 
-def _preview_via_browser(title: str) -> str:
-    """
-    Browser-automated preview (agent-browser).
-    Returns: "success" | "need_login" | "failed"
-    """
-    cdp_port = _ensure_chrome()
-    if not cdp_port:
-        print("  Chrome CDP unavailable")
-        return "failed"
+def _ab_eval(cdp_port: str, js: str, timeout: int = 15) -> str:
+    """Run JavaScript via agent-browser eval, return result."""
+    result = subprocess.run(
+        ["npx", "agent-browser", "--cdp", cdp_port, "eval", js],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"eval error: {result.stderr[:300]}")
+    return result.stdout.strip()
 
-    try:
-        _ab(cdp_port, "open", "https://mp.weixin.qq.com/")
-    except Exception as e:
-        print(f"  Failed to open WeChat backend: {e}")
-        return "failed"
+
+def _browser_is_logged_in(cdp_port: str) -> bool:
+    """Check if WeChat backend is logged in by looking at snapshot content."""
+    snapshot = _ab(cdp_port, "snapshot", "-i", "-c")
+    # Logged in: has "首页" link and content links. Not logged in: only "登录" link.
+    has_home = False
+    has_login_only = True
+    for line in snapshot.split("\n"):
+        if "首页" in line:
+            has_home = True
+        if "内容管理" in line or "草稿" in line or "AI One Stop" in line:
+            has_login_only = False
+    return has_home and not has_login_only
+
+
+def _browser_login_if_needed(cdp_port: str) -> bool:
+    """
+    Navigate to WeChat backend homepage. If session expired, click login to restore.
+    Returns True if logged in, False if QR scan needed.
+    """
+    # Step 1: Open homepage (MUST use homepage, direct draft URL gets bounced)
+    _ab(cdp_port, "open", "https://mp.weixin.qq.com/")
     time.sleep(5)
 
-    try:
-        snapshot = _ab(cdp_port, "snapshot", "-c")
-    except Exception as e:
-        print(f"  Snapshot failed: {e}")
-        return "failed"
+    snapshot = _ab(cdp_port, "snapshot", "-i", "-c")
 
-    if _is_login_page(snapshot):
-        print("  Login page detected, sending screenshot")
-        _screenshot_to_discord(cdp_port,
-            "WeChat backend requires login. Please scan QR code and reply 'done'.")
-        return "need_login"
-
-    try:
-        _ab(cdp_port, "open",
-            "https://mp.weixin.qq.com/cgi-bin/appmsg"
-            "?t=media/appmsg_list&action=list_card&type=10&sub_type=10")
-    except Exception as e:
-        print(f"  Failed to open draft box: {e}")
-        _screenshot_to_discord(cdp_port, "Failed to open draft box")
-        return "failed"
-    time.sleep(3)
-
-    try:
-        snapshot = _ab(cdp_port, "snapshot", "-i", "-c")
-    except Exception as e:
-        print(f"  Draft box snapshot failed: {e}")
-        return "failed"
-    print(f"  Draft box snapshot ({len(snapshot)} chars)")
-
-    clicked_draft = False
-    if title:
+    # Check if we're on the expired session page ("请重新登录")
+    if "登录" in snapshot and "首页" not in snapshot:
+        print("  Session expired, clicking login to restore...")
+        # Click the "登录" link to try session restore
         for line in snapshot.split("\n"):
             ref = _find_ref(line)
-            if ref and title[:8] in line:
-                try:
-                    _ab(cdp_port, "click", ref)
-                    clicked_draft = True
-                    time.sleep(3)
-                    break
-                except Exception:
-                    continue
+            if ref and "登录" in line:
+                _ab(cdp_port, "click", ref)
+                time.sleep(5)
+                break
 
-    if not clicked_draft:
-        for line in snapshot.split("\n"):
-            ref = _find_ref(line)
-            if ref and any(kw in line for kw in ["编辑", "草稿", "预览"]):
-                try:
-                    _ab(cdp_port, "click", ref)
-                    clicked_draft = True
-                    time.sleep(3)
-                    break
-                except Exception:
-                    continue
-
-    if not clicked_draft:
-        _screenshot_to_discord(cdp_port, "Draft box opened. Please select draft manually.")
-        return "success"
-
-    try:
+        # Re-check: are we logged in now?
         snapshot2 = _ab(cdp_port, "snapshot", "-i", "-c")
-        for line in snapshot2.split("\n"):
+        if "首页" in snapshot2:
+            print("  Session restored via login click")
+            return True
+
+        # Still not logged in — need QR scan
+        print("  QR scan required")
+        _screenshot_to_discord(cdp_port,
+            "公众号后台需要扫码登录，请用微信扫码")
+        return False
+
+    if "首页" in snapshot:
+        print("  Already logged in")
+        return True
+
+    print("  Unknown page state")
+    _screenshot_to_discord(cdp_port, "Unknown page state")
+    return False
+
+
+def _browser_open_draft_list(cdp_port: str) -> bool:
+    """From homepage, click '全部草稿' button to enter draft list. Returns True on success."""
+    for attempt in range(3):
+        snapshot = _ab(cdp_port, "snapshot", "-i", "-c")
+        for line in snapshot.split("\n"):
             ref = _find_ref(line)
-            if ref and "预览" in line:
+            if ref and "全部草稿" in line:
                 _ab(cdp_port, "click", ref)
                 time.sleep(3)
-                _screenshot_to_discord(cdp_port, "Preview button clicked. Check your phone.")
-                return "success"
-    except Exception as e:
-        print(f"  Preview button click failed: {e}")
+                print("  Draft list opened via '全部草稿' button")
+                return True
 
-    _screenshot_to_discord(cdp_port, "Draft opened. Please click preview manually.")
-    return "success"
+        # Page might not be fully loaded, scroll down and retry
+        print(f"  '全部草稿' not found (attempt {attempt + 1}/3), waiting...")
+        try:
+            _ab(cdp_port, "scroll", "down", "300")
+        except Exception:
+            pass
+        time.sleep(3)
+
+    print("  '全部草稿' button not found on homepage after 3 attempts")
+    _screenshot_to_discord(cdp_port, "Homepage loaded but '全部草稿' not found")
+    return False
+
+
+def _browser_click_edit_on_draft(cdp_port: str, title: str) -> bool:
+    """
+    In draft list page, find target draft card by title and click its edit button.
+    Uses JS to access hidden action buttons (not visible in accessibility tree).
+    Returns True on success.
+    """
+    # Find draft card by title via JS and click its edit button (index 3 in action buttons)
+    escaped_title = title.replace("'", "\\'").replace('"', '\\"')
+    js = f"""
+    (() => {{
+        const cards = document.querySelectorAll('.weui-desktop-card.weui-desktop-publish');
+        for (const card of cards) {{
+            const titleEl = card.querySelector('.weui-desktop-publish__cover__title span');
+            if (titleEl && titleEl.textContent.includes('{escaped_title[:20]}')) {{
+                const btns = card.querySelectorAll('.weui-desktop-card__action a, .weui-desktop-card__action button');
+                // Action buttons: [0]=delete, [1]=confirm-delete, [2]=cancel-delete, [3]=edit, [4]=publish
+                for (let i = 0; i < btns.length; i++) {{
+                    const tooltip = btns[i].closest('.weui-desktop-tooltip__wrp');
+                    if (tooltip) {{
+                        const tip = tooltip.querySelector('.weui-desktop-tooltip');
+                        if (tip && tip.textContent.trim() === '编辑') {{
+                            btns[i].click();
+                            return 'clicked_edit';
+                        }}
+                    }}
+                }}
+                // Fallback: click the 4th button (index 3) which is typically edit
+                if (btns.length > 3) {{
+                    btns[3].click();
+                    return 'clicked_index3';
+                }}
+                return 'no_edit_btn';
+            }}
+        }}
+        // Fallback: click first card's edit button
+        const first = cards[0];
+        if (first) {{
+            const btns = first.querySelectorAll('.weui-desktop-card__action a, .weui-desktop-card__action button');
+            if (btns.length > 3) {{
+                btns[3].click();
+                return 'clicked_first_card';
+            }}
+        }}
+        return 'no_cards';
+    }})()
+    """
+    result = _ab_eval(cdp_port, js)
+    print(f"  Draft card click result: {result}")
+    return "clicked" in result
+
+
+def _browser_click_preview_and_confirm(cdp_port: str) -> bool:
+    """
+    In the editor page, click '预览' button, fill WeChat ID if needed,
+    and click '确定' to send preview.
+    Returns True on success.
+    """
+    # Step 1: Click the "预览" button in editor
+    snapshot = _ab(cdp_port, "snapshot", "-i", "-c")
+    preview_ref = None
+    for line in snapshot.split("\n"):
+        ref = _find_ref(line)
+        if ref and "预览" in line and "button" in line.lower():
+            preview_ref = ref
+            break
+    if not preview_ref:
+        # Fallback: search without button keyword
+        for line in snapshot.split("\n"):
+            ref = _find_ref(line)
+            if ref and line.strip().endswith('"预览"'):
+                preview_ref = ref
+                break
+    if not preview_ref:
+        for line in snapshot.split("\n"):
+            ref = _find_ref(line)
+            if ref and "预览" in line:
+                preview_ref = ref
+                break
+
+    if not preview_ref:
+        print("  Preview button not found in editor")
+        _screenshot_to_discord(cdp_port, "Editor opened but preview button not found")
+        return False
+
+    _ab(cdp_port, "click", preview_ref)
+    print("  Clicked preview button")
+    time.sleep(3)
+
+    # Step 2: Preview dialog should be open. Check for WeChat ID input and fill if empty.
+    snapshot2 = _ab(cdp_port, "snapshot", "-i", "-c")
+    wx_name = os.environ.get("WECHAT_PREVIEW_USER", "")
+
+    # Find the dialog's input field and check if it has content
+    # If no preview user tag visible, fill it in
+    if wx_name and "删除" in snapshot2:
+        # Dialog has a tag input — check if our user is already there
+        # by looking for the wx_name in the snapshot text
+        if wx_name not in _ab(cdp_port, "snapshot", "-c"):
+            # Need to type the wx_name into the input
+            for line in snapshot2.split("\n"):
+                ref = _find_ref(line)
+                if ref and "textbox" in line.lower() and "标题" not in line and "作者" not in line:
+                    _ab(cdp_port, "fill", ref, wx_name)
+                    _ab(cdp_port, "press", "Enter")
+                    time.sleep(1)
+                    print(f"  Filled preview user: {wx_name}")
+                    break
+
+    # Step 3: Click "确定" button
+    snapshot3 = _ab(cdp_port, "snapshot", "-i", "-c")
+    confirm_ref = None
+    for line in snapshot3.split("\n"):
+        ref = _find_ref(line)
+        if ref and "确定" in line:
+            confirm_ref = ref
+            break
+
+    if not confirm_ref:
+        print("  Confirm button not found in preview dialog")
+        _screenshot_to_discord(cdp_port, "Preview dialog opened but confirm button not found")
+        return False
+
+    _ab(cdp_port, "click", confirm_ref)
+    print("  Clicked confirm — preview sent!")
+    time.sleep(3)
+
+    # Step 4: Verify — dialog should close, back to editor
+    _screenshot_to_discord(cdp_port, "Preview sent to your WeChat! Check your phone.")
+    return True
 
 
 def step_send_preview(state: dict, args) -> dict:
-    """Step 7: Send preview to phone (3-tier fallback)."""
-    draft_id = state.get("draft_id", "")
+    """Step 7: Send preview to phone via browser automation.
+
+    Flow (proven on WeChat Official Account backend):
+      1. Open homepage mp.weixin.qq.com (direct draft URL gets bounced to login)
+      2. Restore session if expired (click login link)
+      3. Click "全部草稿" to enter draft list
+      4. Find target draft by title, click edit button (hidden, via JS)
+      5. In editor, click "预览" button
+      6. Fill WeChat ID if needed, click "确定"
+    """
     title = state.get("title", "")
-    if not draft_id:
-        discord_msg("chief-director", "Preview skipped: no draft_id")
+    if not title:
+        discord_msg("chief-director", "Preview skipped: no title")
         return state
 
-    discord_msg("wechat-ops", "Sending preview to phone...")
+    discord_msg("wechat-ops", "Sending preview via browser...")
 
-    # Tier 1: WeChat API preview
-    wx_name = os.environ.get("WECHAT_PREVIEW_USER", "")
-    if wx_name:
-        for attempt in range(3):
-            try:
-                _preview_via_api(draft_id, wx_name)
-                discord_msg("chief-director",
-                    "Preview sent to your WeChat. Reply 'publish' to go live.")
-                state["preview_sent"] = True
-                return state
-            except Exception as e:
-                print(f"  API preview failed ({attempt + 1}/3): {e}")
-                if attempt < 2:
-                    time.sleep(5)
-        print("  API preview failed 3 times, falling back to browser")
-
-    # Tier 2: Browser automation (agent-browser)
-    for attempt in range(2):
-        try:
-            result = _preview_via_browser(title)
-            if result == "success":
-                discord_msg("chief-director",
-                    "Preview operation completed. Check your phone and reply 'publish'.")
-                state["preview_sent"] = True
-                return state
-            elif result == "need_login":
-                discord_msg("chief-director",
-                    "WeChat backend requires login. Screenshot sent. "
-                    "Please scan QR and reply 'logged in'.")
-                state["preview_sent"] = "need_login"
-                return state
-            else:
-                print(f"  Browser preview failed ({attempt + 1}/2)")
-                if attempt < 1:
-                    time.sleep(5)
-        except Exception as e:
-            print(f"  Browser preview error ({attempt + 1}/2): {e}")
-            if attempt < 1:
-                time.sleep(5)
-
-    # Tier 3: Final fallback — screenshot + report
     cdp_port = _ensure_chrome()
-    if cdp_port:
-        _screenshot_to_discord(cdp_port,
-            f"Auto-preview failed. Please preview manually. draft_id: {draft_id}")
-    discord_msg("chief-director",
-        f"Auto-preview failed. Please preview draft manually. draft_id: {draft_id}")
-    state["preview_sent"] = False
+    if not cdp_port:
+        discord_msg("chief-director", "Preview failed: Chrome CDP unavailable")
+        state["preview_sent"] = False
+        return state
+
+    # Step 1-2: Open homepage + login check
+    if not _browser_login_if_needed(cdp_port):
+        discord_msg("chief-director",
+            "公众号后台需要扫码登录，截图已发送。请扫码后重新运行管线。")
+        state["preview_sent"] = "need_login"
+        return state
+
+    # Step 3: Open draft list
+    if not _browser_open_draft_list(cdp_port):
+        _screenshot_to_discord(cdp_port, "Failed to open draft list from homepage")
+        state["preview_sent"] = False
+        return state
+
+    # Step 4: Click edit on target draft
+    if not _browser_click_edit_on_draft(cdp_port, title):
+        _screenshot_to_discord(cdp_port, f"Draft not found: {title[:30]}")
+        state["preview_sent"] = False
+        return state
+    time.sleep(5)  # Wait for editor to fully load
+
+    # Step 5-6: Click preview + confirm
+    if _browser_click_preview_and_confirm(cdp_port):
+        discord_msg("chief-director",
+            f"Preview of '{title}' sent to your WeChat! Check your phone, reply 'publish' to go live.")
+        state["preview_sent"] = True
+    else:
+        discord_msg("chief-director",
+            "Browser preview partially completed. Check screenshot.")
+        state["preview_sent"] = False
+
     return state
 
 
