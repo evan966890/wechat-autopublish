@@ -375,6 +375,61 @@ def step_format_wechat(state: dict, args) -> dict:
     return state
 
 
+def _preprocess_article(md_text: str, inline_paths: list) -> str:
+    """Preprocess article markdown before publishing:
+    1. Strip editorial metadata after the last '---' separator
+       (alternative titles, digest, image briefs, etc.)
+    2. Insert inline images at section boundaries (after ## headings)
+    """
+    # Step 1: Strip metadata — find the last '---' that's preceded by article content
+    lines = md_text.split("\n")
+    cut_index = len(lines)
+    for i in range(len(lines) - 1, -1, -1):
+        stripped = lines[i].strip()
+        if stripped == "---":
+            # Check if content after this line looks like metadata
+            after = "\n".join(lines[i + 1:])
+            if any(kw in after for kw in ["备选标题", "文章摘要", "配图Brief", "原创声明", "推荐发布"]):
+                cut_index = i
+                break
+    body_lines = lines[:cut_index]
+    # Also strip trailing blank lines
+    while body_lines and body_lines[-1].strip() == "":
+        body_lines.pop()
+
+    # Step 2: Insert inline images at section boundaries
+    if inline_paths:
+        # Find ## heading positions (section starts)
+        heading_positions = []
+        for i, line in enumerate(body_lines):
+            if line.strip().startswith("## "):
+                heading_positions.append(i)
+
+        # Insert images before the 2nd, 3rd, etc. headings (between sections)
+        # Distribute images evenly across section gaps
+        gaps = []
+        for idx in range(1, len(heading_positions)):
+            gaps.append(heading_positions[idx])
+        # If no section headings, insert after the first 1/3 of the article
+        if not gaps:
+            gaps = [len(body_lines) // 3]
+
+        inserted = 0
+        for img_idx, img_path in enumerate(inline_paths):
+            if img_idx < len(gaps):
+                pos = gaps[img_idx] + inserted
+            else:
+                pos = gaps[-1] + inserted
+            img_md = f"\n![]({img_path})\n"
+            body_lines.insert(pos, img_md)
+            inserted += 1
+
+    result = "\n".join(body_lines)
+    print(f"  Preprocessed: {len(md_text)} -> {len(result)} chars "
+          f"(stripped metadata, inserted {len(inline_paths)} images)")
+    return result
+
+
 def step_publish_draft(state: dict, args) -> dict:
     """Step 6: Publish to WeChat draft box."""
     discord_msg("wechat-ops", "Publishing to draft box...")
@@ -383,11 +438,20 @@ def step_publish_draft(state: dict, args) -> dict:
     cover_path = state["cover_path"]
     title = state["title"]
     author = get_config("author", "")
+    inline_paths = state.get("inline_paths", [])
+
+    # Preprocess: strip metadata + insert inline images
+    raw_md = Path(article_path).read_text(encoding="utf-8")
+    processed_md = _preprocess_article(raw_md, inline_paths)
+
+    # Write preprocessed article to temp file
+    processed_path = os.path.join(WORK_DIR, "article_processed.md")
+    Path(processed_path).write_text(processed_md, encoding="utf-8")
 
     script = os.path.join(SCRIPT_DIR, "wechat_publish.py")
     cmd = [
         sys.executable, script,
-        "--article", article_path,
+        "--article", processed_path,
         "--cover", cover_path,
         "--title", title,
     ]
